@@ -171,7 +171,8 @@ class Regr3D (Criterion, MultiLoss):
             valid1 = valid1 & (dis1 <= dist_clip)
             valid2 = valid2 & (dis2 <= dist_clip)
 
-        pr_pts1 = get_pred_pts3d(gt1, pred1, use_pose=False)
+        #gets the prediction aligned with how the ground truth is formed -- if the ground truth is in world frame 
+        pr_pts1 = get_pred_pts3d(gt1, pred1, use_pose=False) 
         pr_pts2 = get_pred_pts3d(gt2, pred2, use_pose=True)
 
         # normalize 3d points

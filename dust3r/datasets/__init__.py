@@ -13,13 +13,13 @@ from .waymo import Waymo  # noqa
 from .wildrgbd import WildRGBD  # noqa
 
 
+
 def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=True, pin_mem=True):
     import torch
     from croco.utils.misc import get_world_size, get_rank
 
-    # pytorch dataset
     if isinstance(dataset, str):
-        dataset = eval(dataset)
+        dataset = eval(dataset) 
 
     world_size = get_world_size()
     rank = get_rank()
