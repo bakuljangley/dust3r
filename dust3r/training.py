@@ -20,6 +20,8 @@ import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Sized
+import torch.distributed as dist
+
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -86,6 +88,7 @@ def get_args_parser():
 
     # output dir
     parser.add_argument('--output_dir', default='./output/', type=str, help="path where to save the output")
+    parser.add_argument('--nodist', default=True, type=bool, help="Whether to run distributed training")
     return parser
 
 
@@ -93,7 +96,7 @@ def train(args):
     misc.init_distributed_mode(args)
     global_rank = misc.get_rank()
     world_size = misc.get_world_size()
-
+    
     print("output_dir: " + args.output_dir)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -120,6 +123,7 @@ def train(args):
     #  dataset and loader
     data_loader_train = build_dataset(args.train_dataset, args.batch_size, args.num_workers, test=False)
     print('Building test dataset {:s}'.format(args.train_dataset))
+    #saves a dictionary of datasetNames as keys and the data_loader as the object at the key
     data_loader_test = {dataset.split('(')[0]: build_dataset(dataset, args.batch_size, args.num_workers, test=True)
                         for dataset in args.test_dataset.split('+')}
 
@@ -133,7 +137,7 @@ def train(args):
 
     model.to(device)
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    # print("Model = %s" % str(model_without_ddp))
 
     if args.pretrained and not args.resume:
         print('Loading pretrained: ', args.pretrained)
@@ -148,17 +152,37 @@ def train(args):
     print("actual lr: %.2e" % args.lr)
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
+    
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True, static_graph=True)
-        model_without_ddp = model.module
+    # print("args distributed", args.distributed)
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    print("All Params Frozen")
+    # Unfreeze only the last few layers of pts3d head (example: downstream_head1.head)
+    for param in model.downstream_head1.dpt.parameters():
+        param.requires_grad = True
+    print("head1 Params Unfrozen")
+    # unfreeze downstream_head2.head:
+    # for param in model.downstream_head2.head.parameters():
+    #     param.requires_grad = True
+    # print("\n Parameters requiring gradients: \n")
+    # for name, param in model_without_ddp.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"Parameter: {name}, Shape: {param.shape}")
+    # print("done")
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(
+    #         model, device_ids=[args.gpu], find_unused_parameters=True, static_graph=True)
+    #     model_without_ddp = model.module
 
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = misc.get_parameter_groups(model_without_ddp, args.weight_decay)
+    #get_parameter_groups : takes in the model and checks the params 
+    #then removes the params that require grad == false
+    param_groups = misc.get_parameter_groups(model_without_ddp, args.weight_decay) 
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    print(optimizer)
-    loss_scaler = NativeScaler()
+    # print(optimizer)
+    loss_scaler = NativeScaler() ##they have a loss scaler that will propogate the losses
 
     def write_log_stats(epoch, train_stats, test_stats):
         if misc.is_main_process():
@@ -167,6 +191,7 @@ def train(args):
 
             log_stats = dict(epoch=epoch, **{f'train_{k}': v for k, v in train_stats.items()})
             for test_name in data_loader_test:
+                print("test_name", test_name)
                 if test_name not in test_stats:
                     continue
                 log_stats.update({test_name + '_' + k: v for k, v in test_stats[test_name].items()})
@@ -220,6 +245,9 @@ def train(args):
             if new_best:
                 save_model(epoch - 1, 'best', best_so_far)
         if epoch >= args.epochs:
+            # Cleanup process group
+            if dist.is_initialized():
+                dist.destroy_process_group()
             break  # exit after writing last test to disk
 
         # Train
@@ -228,6 +256,7 @@ def train(args):
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
             args=args)
+            
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -293,7 +322,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             misc.adjust_learning_rate(optimizer, epoch_f, args)
-
+        
+        #this calls compute_loss(view1,view2,pred1,pred2)
+        #then the loss function should have the argument gt_scale=True
+        #which will not normalise the gt points
         loss_tuple = loss_of_one_batch(batch, model, criterion, device,
                                        symmetrize_batch=True,
                                        use_amp=bool(args.amp), ret='loss')
@@ -317,6 +349,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(epoch=epoch_f)
         metric_logger.update(lr=lr)
         metric_logger.update(loss=loss_value, **loss_details)
+        # EXTRA LOGGING TO log.txt EVERY 5 ITERATIONS
+        if misc.is_main_process() and data_iter_step % 5 == 0:
+            log_stats = {
+                'epoch': epoch_f,
+                'iter': data_iter_step,
+                'lr': lr,
+                'loss': loss_value,
+            }
+            log_stats.update(loss_details)
+            with open(os.path.join(args.output_dir, "log_iter_train.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
         if (data_iter_step + 1) % accum_iter == 0 and ((data_iter_step + 1) % (accum_iter * args.print_freq)) == 0:
             loss_value_reduce = misc.all_reduce_mean(loss_value)  # MUST BE EXECUTED BY ALL NODES
@@ -356,12 +399,23 @@ def test_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
         data_loader.sampler.set_epoch(epoch)
 
-    for _, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         loss_tuple = loss_of_one_batch(batch, model, criterion, device,
                                        symmetrize_batch=True,
                                        use_amp=bool(args.amp), ret='loss')
         loss_value, loss_details = loss_tuple  # criterion returns two values
         metric_logger.update(loss=float(loss_value), **loss_details)
+
+        # EXTRA LOGGING FOR TEST EVERY 0.5 EPOCH
+        if misc.is_main_process() and (data_iter_step + 1) % (len(data_loader) // 2) == 0:
+            log_stats = {
+                'epoch': epoch + 0.5,
+                'iter': data_iter_step,
+                'loss': float(loss_value),
+            }
+            log_stats.update(loss_details)
+            with open(os.path.join(args.output_dir, "log_iter_test.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

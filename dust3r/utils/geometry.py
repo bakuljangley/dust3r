@@ -186,7 +186,7 @@ def depthmap_to_camera_coordinates(depthmap, camera_intrinsics, pseudo_focal=Non
     cu = camera_intrinsics[0, 2]
     cv = camera_intrinsics[1, 2]
 
-    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    u, v = np.meshgrid(np.arange(W), np.arange(H)) #enables vectorization
     z_cam = depthmap
     x_cam = (u - cu) * z_cam / fu
     y_cam = (v - cv) * z_cam / fv
