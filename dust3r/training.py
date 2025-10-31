@@ -158,7 +158,6 @@ def train(args):
     # Freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
-
     print("All Params Frozen")
     # Unfreeze only the last few layers of pts3d head (example: downstream_head1.head)
     for param in model.downstream_head1.dpt.parameters():
